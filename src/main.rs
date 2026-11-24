@@ -644,7 +644,17 @@ impl App {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
-        if !matches!(message, Message::Tick) {
+        let user_activity = match &message {
+            Message::Tick => false,
+            // These arrive for every mouse move, release, and focus loss; only an
+            // in-progress column drag is the user working in this profile.
+            Message::ResizePointerMoved(_) | Message::FinishColumnResize => matches!(
+                self.tabs.get(self.active_tab),
+                Some(Screen::Main(st)) if st.resize_drag.is_some()
+            ),
+            _ => true,
+        };
+        if user_activity {
             if let Some(Screen::Main(st)) = self.tabs.get_mut(self.active_tab) {
                 st.last_activity = Instant::now();
             }
@@ -2788,6 +2798,46 @@ mod feature_tests {
         assert_eq!(reopened.site_width, DEFAULT_SITE_WIDTH + 120.0);
         assert_eq!(reopened.group_width, MIN_COLUMN_WIDTH);
         assert_eq!(reopened.field_widths["email"], MAX_COLUMN_WIDTH);
+    }
+
+    #[test]
+    fn mouse_movement_outside_a_column_drag_does_not_postpone_auto_lock() {
+        let db = Db::open(Path::new(":memory:"), None, None).unwrap();
+        db.init_schema().unwrap();
+        let mut state = enter_main(PathBuf::from("test.am"), db, None);
+        state.auto_lock = AutoLockTimeout::OneMin;
+        let mut app = App {
+            tabs: vec![Screen::Main(state)],
+            active_tab: 0,
+            startup_error: None,
+            shortcuts: ShortcutSettings::default(),
+        };
+        let idle = Duration::from_secs(120);
+        let make_idle = |app: &mut App| {
+            if let Screen::Main(st) = app.active_mut() {
+                st.last_activity = Instant::now().checked_sub(idle).unwrap();
+            }
+        };
+        let idle_for = |app: &App| match &app.tabs[0] {
+            Screen::Main(st) => st.last_activity.elapsed(),
+            _ => panic!("expected main"),
+        };
+
+        let _ = app.update(Message::StartColumnResize(ColumnId::Site));
+        make_idle(&mut app);
+        let _ = app.update(Message::ResizePointerMoved(40.0));
+        assert!(idle_for(&app) < idle);
+        make_idle(&mut app);
+        let _ = app.update(Message::FinishColumnResize);
+        assert!(idle_for(&app) < idle);
+
+        make_idle(&mut app);
+        let _ = app.update(Message::ResizePointerMoved(10.0));
+        let _ = app.update(Message::ResizePointerMoved(20.0));
+        let _ = app.update(Message::FinishColumnResize);
+        assert!(idle_for(&app) >= idle);
+        let _ = app.update(Message::Tick);
+        assert!(matches!(app.tabs[0], Screen::Start));
     }
 
     #[test]
